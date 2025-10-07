@@ -4,6 +4,6 @@ pandas==2.2.3
 yfinance==0.2.48
 requests==2.32.3
 scikit-learn==1.5.2
-tensorflow-cpu==2.18.0
+tensorflow-cpu==2.20.0
 Werkzeug==3.0.6
 gunicorn==23.0.0
