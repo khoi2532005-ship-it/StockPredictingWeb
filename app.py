@@ -9,19 +9,13 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 import warnings
 import os
+import time
 warnings.filterwarnings('ignore')
 
 # Suppress TensorFlow messages
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 app = Flask(__name__)
-
-# Configure yfinance session with timeout and user agent
-import requests
-session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-})
 
 def convert_to_native(obj):
     """Convert numpy/pandas types to native Python types"""
@@ -52,7 +46,7 @@ class StockPredictor:
         self.vix_symbol = "^VIX"
 
     def load_data(self):
-        """Load and prepare stock data"""
+        """Load and prepare stock data with enhanced error handling"""
         try:
             # Calculate date range - last 300 days from today
             end_date = datetime.now()
@@ -60,67 +54,61 @@ class StockPredictor:
 
             print(f"Loading data for {self.ticker_symbol} from {start_date.date()} to {end_date.date()}")
 
-            # Download stock data with timeout and session
-            try:
-                data = yf.download(
-                    tickers=[self.ticker_symbol, self.vix_symbol], 
-                    start=start_date.strftime('%Y-%m-%d'),
-                    end=end_date.strftime('%Y-%m-%d'),
-                    progress=False,
-                    timeout=30
-                )
-            except Exception as download_error:
-                print(f"Error downloading data: {download_error}")
-                # Try downloading without VIX as fallback
-                data = yf.download(
-                    tickers=self.ticker_symbol, 
-                    start=start_date.strftime('%Y-%m-%d'),
-                    end=end_date.strftime('%Y-%m-%d'),
-                    progress=False,
-                    timeout=30
-                )
+            # Try downloading with retries and better error handling
+            max_retries = 3
+            data = None
 
-            if data.empty:
-                print(f"Error: No data found for {self.ticker_symbol}")
+            for attempt in range(max_retries):
+                try:
+                    # Create Ticker object
+                    ticker = yf.Ticker(self.ticker_symbol)
+
+                    # Download historical data
+                    data = ticker.history(
+                        start=start_date.strftime('%Y-%m-%d'),
+                        end=end_date.strftime('%Y-%m-%d'),
+                        interval='1d'
+                    )
+
+                    if not data.empty:
+                        print(f"Successfully downloaded {len(data)} days of data for {self.ticker_symbol}")
+                        break
+
+                    time.sleep(1)  # Wait before retry
+
+                except Exception as e:
+                    print(f"Attempt {attempt + 1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                    continue
+
+            if data is None or data.empty:
+                print(f"Error: No data found for {self.ticker_symbol} after {max_retries} attempts")
                 return False
 
-            # Handle single ticker vs multiple tickers data structure
-            if 'Close' in data.columns:
-                if isinstance(data['Close'], pd.DataFrame):
-                    close = data["Close"]
-                else:
-                    # Single ticker - create DataFrame
-                    close = pd.DataFrame({self.ticker_symbol: data['Close']})
-            else:
-                print(f"Error: Unexpected data structure for {self.ticker_symbol}")
+            # Use Close price column
+            if 'Close' not in data.columns:
+                print(f"Error: No Close price data for {self.ticker_symbol}")
                 return False
+
+            stock_close = data['Close'].dropna()
 
             # Check if we have enough data
-            if len(close) < 30:
-                print(f"Error: Insufficient data for {self.ticker_symbol} (only {len(close)} days)")
+            if len(stock_close) < 30:
+                print(f"Error: Insufficient data for {self.ticker_symbol} (only {len(stock_close)} days)")
                 return False
 
             # Create features for Ridge model
-            stock_features = pd.DataFrame({
-                'stock_sma5': close[self.ticker_symbol].rolling(5).mean().shift(1),
-                'stock_sma20': close[self.ticker_symbol].rolling(20).mean().shift(1)
-            })
+            features_df = pd.DataFrame({
+                'stock_sma5': stock_close.rolling(5).mean().shift(1),
+                'stock_sma20': stock_close.rolling(20).mean().shift(1)
+            }).dropna()
 
-            # Check if VIX data is available
-            if self.vix_symbol in close.columns:
-                vix_features = pd.DataFrame({
-                    'vix_sma5': close[self.vix_symbol].rolling(5).mean().shift(1),
-                    'vix_sma20': close[self.vix_symbol].rolling(20).mean().shift(1)
-                })
-                features = pd.concat([stock_features, vix_features], axis=1).dropna()
-            else:
-                features = stock_features.dropna()
-
-            target = close[self.ticker_symbol].loc[features.index]
+            target = stock_close.loc[features_df.index]
 
             # Scale features for Ridge
             self.scaler = StandardScaler()
-            X_scaled = self.scaler.fit_transform(features)
+            X_scaled = self.scaler.fit_transform(features_df)
             y = target.values
 
             # Train Ridge model
@@ -130,8 +118,6 @@ class StockPredictor:
             # Prepare LSTM data
             lookback = 20
             X_lstm, y_lstm = [], []
-
-            stock_close = close[self.ticker_symbol].dropna()
 
             for i in range(lookback, len(stock_close)):
                 X_lstm.append(stock_close.iloc[i-lookback:i].values)
@@ -165,8 +151,8 @@ class StockPredictor:
             self.lstm_model.fit(X_scaled[:train_size], y_scaled[:train_size], 
                               epochs=50, batch_size=16, verbose=0)
 
-            self.close_data = close
-            self.features = features
+            self.stock_close = stock_close
+            self.features_df = features_df
             return True
 
         except Exception as e:
@@ -182,33 +168,26 @@ class StockPredictor:
                        self.scaler_x, self.scaler_y]):
                 return None
 
-            last_date = self.close_data.index[-1]
+            last_date = self.stock_close.index[-1]
             if isinstance(last_date, pd.Timestamp):
                 last_date = last_date.to_pydatetime()
 
-            current_price = self.close_data[self.ticker_symbol].iloc[-1]
+            current_price = self.stock_close.iloc[-1]
 
             next_date = last_date + timedelta(days=1)
             while next_date.weekday() >= 5:
                 next_date += timedelta(days=1)
 
-            stock_sma5 = self.close_data[self.ticker_symbol].rolling(5).mean().iloc[-1]
-            stock_sma20 = self.close_data[self.ticker_symbol].rolling(20).mean().iloc[-1]
+            stock_sma5 = self.stock_close.rolling(5).mean().iloc[-1]
+            stock_sma20 = self.stock_close.rolling(20).mean().iloc[-1]
 
-            if self.vix_symbol in self.close_data.columns:
-                vix_sma5 = self.close_data[self.vix_symbol].rolling(5).mean().iloc[-1]
-                vix_sma20 = self.close_data[self.vix_symbol].rolling(20).mean().iloc[-1]
-                feature_row = pd.DataFrame([[stock_sma5, stock_sma20, vix_sma5, vix_sma20]], 
-                                         columns=self.features.columns)
-            else:
-                feature_row = pd.DataFrame([[stock_sma5, stock_sma20]], 
-                                         columns=self.features.columns)
+            feature_row = pd.DataFrame([[stock_sma5, stock_sma20]], 
+                                     columns=self.features_df.columns)
 
             feature_scaled = self.scaler.transform(feature_row)
             ridge_prediction = self.ridge_model.predict(feature_scaled)[0]
 
-            stock_close = self.close_data[self.ticker_symbol].dropna()
-            last_sequence = stock_close.iloc[-20:].values.reshape(1, 20, 1)
+            last_sequence = self.stock_close.iloc[-20:].values.reshape(1, 20, 1)
             last_sequence_scaled = self.scaler_x.transform(
                 last_sequence.reshape(-1, 1)).reshape(1, 20, 1)
 
@@ -293,7 +272,7 @@ def predict():
         if not predictor.load_data():
             return jsonify({
                 'success': False, 
-                'error': f'Failed to load data for {ticker}. This could be due to an invalid ticker symbol or temporary connection issues with Yahoo Finance. Please try again.'
+                'error': f'Unable to fetch data for {ticker}. This may be due to: (1) Invalid ticker symbol, (2) Temporary connection issues, or (3) Data provider limitations. Please try again or use a different ticker.'
             }), 400
 
         prediction = predictor.predict_next_day()
@@ -301,7 +280,7 @@ def predict():
         if prediction is None:
             return jsonify({
                 'success': False, 
-                'error': 'Failed to make prediction'
+                'error': 'Failed to generate prediction'
             }), 500
 
         return jsonify({
@@ -314,7 +293,7 @@ def predict():
         traceback.print_exc()
         return jsonify({
             'success': False, 
-            'error': str(e)
+            'error': f'Server error: {str(e)}'
         }), 500
 
 @app.route('/health', methods=['GET'])
