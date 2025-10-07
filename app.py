@@ -16,6 +16,13 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 app = Flask(__name__)
 
+# Configure yfinance session with timeout and user agent
+import requests
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+})
+
 def convert_to_native(obj):
     """Convert numpy/pandas types to native Python types"""
     if isinstance(obj, (np.bool_, bool)):
@@ -53,21 +60,44 @@ class StockPredictor:
 
             print(f"Loading data for {self.ticker_symbol} from {start_date.date()} to {end_date.date()}")
 
-            # Download stock data
-            data = yf.download(tickers=[self.ticker_symbol, self.vix_symbol], 
-                             start=start_date.strftime('%Y-%m-%d'),
-                             end=end_date.strftime('%Y-%m-%d'),
-                             progress=False)
+            # Download stock data with timeout and session
+            try:
+                data = yf.download(
+                    tickers=[self.ticker_symbol, self.vix_symbol], 
+                    start=start_date.strftime('%Y-%m-%d'),
+                    end=end_date.strftime('%Y-%m-%d'),
+                    progress=False,
+                    timeout=30
+                )
+            except Exception as download_error:
+                print(f"Error downloading data: {download_error}")
+                # Try downloading without VIX as fallback
+                data = yf.download(
+                    tickers=self.ticker_symbol, 
+                    start=start_date.strftime('%Y-%m-%d'),
+                    end=end_date.strftime('%Y-%m-%d'),
+                    progress=False,
+                    timeout=30
+                )
 
-            if data.empty or 'Close' not in data.columns:
+            if data.empty:
                 print(f"Error: No data found for {self.ticker_symbol}")
                 return False
 
-            close = data["Close"]
+            # Handle single ticker vs multiple tickers data structure
+            if 'Close' in data.columns:
+                if isinstance(data['Close'], pd.DataFrame):
+                    close = data["Close"]
+                else:
+                    # Single ticker - create DataFrame
+                    close = pd.DataFrame({self.ticker_symbol: data['Close']})
+            else:
+                print(f"Error: Unexpected data structure for {self.ticker_symbol}")
+                return False
 
             # Check if we have enough data
             if len(close) < 30:
-                print(f"Error: Insufficient data for {self.ticker_symbol}")
+                print(f"Error: Insufficient data for {self.ticker_symbol} (only {len(close)} days)")
                 return False
 
             # Create features for Ridge model
@@ -263,7 +293,7 @@ def predict():
         if not predictor.load_data():
             return jsonify({
                 'success': False, 
-                'error': f'Failed to load data for {ticker}. Please check if the ticker symbol is correct.'
+                'error': f'Failed to load data for {ticker}. This could be due to an invalid ticker symbol or temporary connection issues with Yahoo Finance. Please try again.'
             }), 400
 
         prediction = predictor.predict_next_day()
