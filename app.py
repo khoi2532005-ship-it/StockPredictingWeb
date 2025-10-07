@@ -10,7 +10,6 @@ from tensorflow.keras.layers import LSTM, Dense
 import warnings
 import os
 import time
-import requests
 warnings.filterwarnings('ignore')
 
 # Suppress TensorFlow messages
@@ -18,20 +17,15 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 app = Flask(__name__)
 
-# Configure requests session with proper headers
-session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'DNT': '1',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1'
-})
-
-# Override yfinance's session
-yf.utils.session = session
+# Create curl_cffi session for yfinance
+try:
+    from curl_cffi import requests as curl_requests
+    session = curl_requests.Session(impersonate="chrome")
+    print("✅ Using curl_cffi session (bypasses Yahoo Finance blocking)")
+except ImportError:
+    print("⚠️ curl_cffi not available, using standard requests")
+    import requests
+    session = requests.Session()
 
 def convert_to_native(obj):
     """Convert numpy/pandas types to native Python types"""
@@ -61,40 +55,37 @@ class StockPredictor:
         self.ticker_symbol = ticker_symbol.upper()
 
     def load_data(self):
-        """Load and prepare stock data with enhanced session handling"""
+        """Load and prepare stock data using curl_cffi session"""
         try:
-            # Calculate date range
             end_date = datetime.now()
-            start_date = end_date - timedelta(days=365)  # Use 1 year instead of 300 days
+            start_date = end_date - timedelta(days=365)
 
             print(f"Loading data for {self.ticker_symbol} from {start_date.date()} to {end_date.date()}")
 
-            # Try multiple methods to get data
+            # Use curl_cffi session with yfinance
             data = None
             max_retries = 3
 
             for attempt in range(max_retries):
                 try:
-                    print(f"Attempt {attempt + 1}/{max_retries}")
+                    print(f"Attempt {attempt + 1}/{max_retries} using curl_cffi...")
 
-                    # Method 1: Using download with session
+                    # Download with curl_cffi session
                     ticker_obj = yf.Ticker(self.ticker_symbol, session=session)
                     data = ticker_obj.history(
                         period='1y',
                         interval='1d',
-                        auto_adjust=True,
-                        prepost=False
+                        auto_adjust=True
                     )
 
                     if not data.empty and len(data) > 30:
-                        print(f"Success! Downloaded {len(data)} days of data")
+                        print(f"✅ Success! Downloaded {len(data)} days of data")
                         break
 
-                    # Wait before retry
                     time.sleep(2 * (attempt + 1))
 
                 except Exception as e:
-                    print(f"Attempt {attempt + 1} error: {str(e)[:100]}")
+                    print(f"Attempt {attempt + 1} error: {str(e)[:150]}")
                     if attempt < max_retries - 1:
                         time.sleep(3)
                     continue
@@ -110,7 +101,7 @@ class StockPredictor:
                 print(f"Insufficient data: only {len(stock_close)} days")
                 return False
 
-            print(f"Using {len(stock_close)} days of data for training")
+            print(f"Training models with {len(stock_close)} days of data")
 
             # Create features for Ridge model
             features_df = pd.DataFrame({
@@ -166,7 +157,7 @@ class StockPredictor:
 
             self.stock_close = stock_close
             self.features_df = features_df
-            print("Model training complete!")
+            print("✅ Model training complete!")
             return True
 
         except Exception as e:
@@ -288,7 +279,7 @@ def predict():
         if not predictor.load_data():
             return jsonify({
                 'success': False, 
-                'error': f'Unable to fetch data for {ticker}. Yahoo Finance may be temporarily unavailable or the ticker symbol is invalid. Please try: (1) Another ticker like AAPL or MSFT, (2) Waiting a few moments and trying again.'
+                'error': f'Unable to fetch data for {ticker}. Please try another ticker or wait a moment.'
             }), 400
 
         prediction = predictor.predict_next_day()
@@ -299,7 +290,7 @@ def predict():
                 'error': 'Failed to generate prediction'
             }), 500
 
-        print(f"Prediction successful for {ticker}!")
+        print(f"✅ Prediction successful for {ticker}!")
         return jsonify({
             'success': True,
             'prediction': prediction
@@ -310,7 +301,7 @@ def predict():
         traceback.print_exc()
         return jsonify({
             'success': False, 
-            'error': f'Server error: Please try again'
+            'error': f'Server error. Please try again.'
         }), 500
 
 @app.route('/health', methods=['GET'])
