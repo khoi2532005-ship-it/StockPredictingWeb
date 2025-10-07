@@ -12,18 +12,16 @@ import os
 import time
 warnings.filterwarnings('ignore')
 
-# Suppress TensorFlow messages
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 app = Flask(__name__)
 
-# Create curl_cffi session for yfinance
+# Use curl_cffi for yfinance
 try:
     from curl_cffi import requests as curl_requests
     session = curl_requests.Session(impersonate="chrome")
-    print("✅ Using curl_cffi session (bypasses Yahoo Finance blocking)")
+    print("✅ Using curl_cffi session")
 except ImportError:
-    print("⚠️ curl_cffi not available, using standard requests")
     import requests
     session = requests.Session()
 
@@ -55,53 +53,23 @@ class StockPredictor:
         self.ticker_symbol = ticker_symbol.upper()
 
     def load_data(self):
-        """Load and prepare stock data using curl_cffi session"""
+        """Load and prepare stock data - OPTIMIZED for free tier"""
         try:
             end_date = datetime.now()
-            start_date = end_date - timedelta(days=365)
+            start_date = end_date - timedelta(days=180)  # Use 6 months instead of 1 year
 
-            print(f"Loading data for {self.ticker_symbol} from {start_date.date()} to {end_date.date()}")
+            print(f"Loading data for {self.ticker_symbol}")
 
-            # Use curl_cffi session with yfinance
-            data = None
-            max_retries = 3
+            # Download data
+            ticker_obj = yf.Ticker(self.ticker_symbol, session=session)
+            data = ticker_obj.history(period='6mo', interval='1d', auto_adjust=True)
 
-            for attempt in range(max_retries):
-                try:
-                    print(f"Attempt {attempt + 1}/{max_retries} using curl_cffi...")
-
-                    # Download with curl_cffi session
-                    ticker_obj = yf.Ticker(self.ticker_symbol, session=session)
-                    data = ticker_obj.history(
-                        period='1y',
-                        interval='1d',
-                        auto_adjust=True
-                    )
-
-                    if not data.empty and len(data) > 30:
-                        print(f"✅ Success! Downloaded {len(data)} days of data")
-                        break
-
-                    time.sleep(2 * (attempt + 1))
-
-                except Exception as e:
-                    print(f"Attempt {attempt + 1} error: {str(e)[:150]}")
-                    if attempt < max_retries - 1:
-                        time.sleep(3)
-                    continue
-
-            if data is None or data.empty or len(data) < 30:
-                print(f"Failed to load data for {self.ticker_symbol}")
+            if data.empty or len(data) < 30:
+                print(f"Insufficient data for {self.ticker_symbol}")
                 return False
 
-            # Use Close price
             stock_close = data['Close'].dropna()
-
-            if len(stock_close) < 30:
-                print(f"Insufficient data: only {len(stock_close)} days")
-                return False
-
-            print(f"Training models with {len(stock_close)} days of data")
+            print(f"✅ Downloaded {len(stock_close)} days of data")
 
             # Create features for Ridge model
             features_df = pd.DataFrame({
@@ -111,17 +79,17 @@ class StockPredictor:
 
             target = stock_close.loc[features_df.index]
 
-            # Scale features for Ridge
+            # Train Ridge model (fast)
             self.scaler = StandardScaler()
             X_scaled = self.scaler.fit_transform(features_df)
             y = target.values
 
-            # Train Ridge model
             self.ridge_model = Ridge(solver='svd', alpha=1, random_state=69)
             self.ridge_model.fit(X_scaled, y)
+            print("✅ Ridge model trained")
 
-            # Prepare LSTM data
-            lookback = 20
+            # OPTIMIZED LSTM: Smaller network, fewer epochs
+            lookback = 10  # Reduced from 20
             X_lstm, y_lstm = [], []
 
             for i in range(lookback, len(stock_close)):
@@ -143,25 +111,33 @@ class StockPredictor:
 
             y_scaled = self.scaler_y.fit_transform(y_lstm.reshape(-1, 1))
 
-            # Build and train LSTM model
+            # LIGHTER LSTM: 25 units instead of 50, 15 epochs instead of 50
             self.lstm_model = Sequential([
-                LSTM(50, activation='tanh', input_shape=(timesteps, num_features)),
+                LSTM(25, activation='tanh', input_shape=(timesteps, num_features)),
                 Dense(1)
             ])
 
             self.lstm_model.compile(optimizer='adam', loss='mse')
 
+            # Train on 80% of data with fewer epochs
             train_size = int(0.8 * len(X_scaled))
-            self.lstm_model.fit(X_scaled[:train_size], y_scaled[:train_size], 
-                              epochs=50, batch_size=16, verbose=0)
+            print(f"Training LSTM (lite mode)...")
+            self.lstm_model.fit(
+                X_scaled[:train_size], 
+                y_scaled[:train_size], 
+                epochs=15,  # Reduced from 50
+                batch_size=32,  # Increased from 16 for speed
+                verbose=0
+            )
 
             self.stock_close = stock_close
             self.features_df = features_df
-            print("✅ Model training complete!")
+            self.lookback = lookback
+            print("✅ LSTM model trained (lite)")
             return True
 
         except Exception as e:
-            print(f"Error in load_data: {e}")
+            print(f"Error: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -183,6 +159,7 @@ class StockPredictor:
             while next_date.weekday() >= 5:
                 next_date += timedelta(days=1)
 
+            # Ridge prediction
             stock_sma5 = self.stock_close.rolling(5).mean().iloc[-1]
             stock_sma20 = self.stock_close.rolling(20).mean().iloc[-1]
 
@@ -192,9 +169,10 @@ class StockPredictor:
             feature_scaled = self.scaler.transform(feature_row)
             ridge_prediction = self.ridge_model.predict(feature_scaled)[0]
 
-            last_sequence = self.stock_close.iloc[-20:].values.reshape(1, 20, 1)
+            # LSTM prediction (using reduced lookback)
+            last_sequence = self.stock_close.iloc[-self.lookback:].values.reshape(1, self.lookback, 1)
             last_sequence_scaled = self.scaler_x.transform(
-                last_sequence.reshape(-1, 1)).reshape(1, 20, 1)
+                last_sequence.reshape(-1, 1)).reshape(1, self.lookback, 1)
 
             lstm_pred_scaled = self.lstm_model.predict(last_sequence_scaled, verbose=0)
             lstm_prediction = self.scaler_y.inverse_transform(lstm_pred_scaled)[0, 0]
@@ -233,23 +211,17 @@ class StockPredictor:
 
             result = convert_to_native(result)
 
-            result['current_price'] = round(result['current_price'], 2)
-            result['ridge_prediction'] = round(result['ridge_prediction'], 2)
-            result['lstm_prediction'] = round(result['lstm_prediction'], 2)
-            result['average_prediction'] = round(result['average_prediction'], 2)
-            result['ridge_change'] = round(result['ridge_change'], 2)
-            result['lstm_change'] = round(result['lstm_change'], 2)
-            result['average_change'] = round(result['average_change'], 2)
-            result['ridge_change_pct'] = round(result['ridge_change_pct'], 2)
-            result['lstm_change_pct'] = round(result['lstm_change_pct'], 2)
-            result['average_change_pct'] = round(result['average_change_pct'], 2)
+            # Round values
+            for key in ['current_price', 'ridge_prediction', 'lstm_prediction', 
+                       'average_prediction', 'ridge_change', 'lstm_change', 
+                       'average_change', 'ridge_change_pct', 'lstm_change_pct', 
+                       'average_change_pct']:
+                result[key] = round(result[key], 2)
 
             return result
 
         except Exception as e:
             print(f"Error making prediction: {e}")
-            import traceback
-            traceback.print_exc()
             return None
 
 @app.route('/')
@@ -271,7 +243,7 @@ def predict():
             ticker = '^GSPC'
 
         print(f"\n{'='*60}")
-        print(f"Predicting for ticker: {ticker}")
+        print(f"Predicting for: {ticker}")
         print('='*60)
 
         predictor = StockPredictor(ticker)
@@ -279,7 +251,7 @@ def predict():
         if not predictor.load_data():
             return jsonify({
                 'success': False, 
-                'error': f'Unable to fetch data for {ticker}. Please try another ticker or wait a moment.'
+                'error': f'Unable to fetch data for {ticker}. Please try another ticker.'
             }), 400
 
         prediction = predictor.predict_next_day()
@@ -290,7 +262,7 @@ def predict():
                 'error': 'Failed to generate prediction'
             }), 500
 
-        print(f"✅ Prediction successful for {ticker}!")
+        print(f"✅ Prediction complete!")
         return jsonify({
             'success': True,
             'prediction': prediction
@@ -301,13 +273,13 @@ def predict():
         traceback.print_exc()
         return jsonify({
             'success': False, 
-            'error': f'Server error. Please try again.'
+            'error': 'Server error. Please try again.'
         }), 500
 
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
-    return jsonify({'status': 'healthy', 'service': 'Stock Predictor API'})
+    return jsonify({'status': 'healthy'})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
