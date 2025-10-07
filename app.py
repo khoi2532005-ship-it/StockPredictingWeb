@@ -10,12 +10,28 @@ from tensorflow.keras.layers import LSTM, Dense
 import warnings
 import os
 import time
+import requests
 warnings.filterwarnings('ignore')
 
 # Suppress TensorFlow messages
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 app = Flask(__name__)
+
+# Configure requests session with proper headers
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'DNT': '1',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1'
+})
+
+# Override yfinance's session
+yf.utils.session = session
 
 def convert_to_native(obj):
     """Convert numpy/pandas types to native Python types"""
@@ -43,60 +59,58 @@ class StockPredictor:
         self.scaler_x = None
         self.scaler_y = None
         self.ticker_symbol = ticker_symbol.upper()
-        self.vix_symbol = "^VIX"
 
     def load_data(self):
-        """Load and prepare stock data with enhanced error handling"""
+        """Load and prepare stock data with enhanced session handling"""
         try:
-            # Calculate date range - last 300 days from today
+            # Calculate date range
             end_date = datetime.now()
-            start_date = end_date - timedelta(days=300)
+            start_date = end_date - timedelta(days=365)  # Use 1 year instead of 300 days
 
             print(f"Loading data for {self.ticker_symbol} from {start_date.date()} to {end_date.date()}")
 
-            # Try downloading with retries and better error handling
-            max_retries = 3
+            # Try multiple methods to get data
             data = None
+            max_retries = 3
 
             for attempt in range(max_retries):
                 try:
-                    # Create Ticker object
-                    ticker = yf.Ticker(self.ticker_symbol)
+                    print(f"Attempt {attempt + 1}/{max_retries}")
 
-                    # Download historical data
-                    data = ticker.history(
-                        start=start_date.strftime('%Y-%m-%d'),
-                        end=end_date.strftime('%Y-%m-%d'),
-                        interval='1d'
+                    # Method 1: Using download with session
+                    ticker_obj = yf.Ticker(self.ticker_symbol, session=session)
+                    data = ticker_obj.history(
+                        period='1y',
+                        interval='1d',
+                        auto_adjust=True,
+                        prepost=False
                     )
 
-                    if not data.empty:
-                        print(f"Successfully downloaded {len(data)} days of data for {self.ticker_symbol}")
+                    if not data.empty and len(data) > 30:
+                        print(f"Success! Downloaded {len(data)} days of data")
                         break
 
-                    time.sleep(1)  # Wait before retry
+                    # Wait before retry
+                    time.sleep(2 * (attempt + 1))
 
                 except Exception as e:
-                    print(f"Attempt {attempt + 1} failed: {e}")
+                    print(f"Attempt {attempt + 1} error: {str(e)[:100]}")
                     if attempt < max_retries - 1:
-                        time.sleep(2)
+                        time.sleep(3)
                     continue
 
-            if data is None or data.empty:
-                print(f"Error: No data found for {self.ticker_symbol} after {max_retries} attempts")
+            if data is None or data.empty or len(data) < 30:
+                print(f"Failed to load data for {self.ticker_symbol}")
                 return False
 
-            # Use Close price column
-            if 'Close' not in data.columns:
-                print(f"Error: No Close price data for {self.ticker_symbol}")
-                return False
-
+            # Use Close price
             stock_close = data['Close'].dropna()
 
-            # Check if we have enough data
             if len(stock_close) < 30:
-                print(f"Error: Insufficient data for {self.ticker_symbol} (only {len(stock_close)} days)")
+                print(f"Insufficient data: only {len(stock_close)} days")
                 return False
+
+            print(f"Using {len(stock_close)} days of data for training")
 
             # Create features for Ridge model
             features_df = pd.DataFrame({
@@ -125,7 +139,6 @@ class StockPredictor:
 
             X_lstm = np.array(X_lstm)
             y_lstm = np.array(y_lstm)
-
             X_lstm = X_lstm.reshape(X_lstm.shape[0], X_lstm.shape[1], 1)
 
             # Scale LSTM data
@@ -153,10 +166,11 @@ class StockPredictor:
 
             self.stock_close = stock_close
             self.features_df = features_df
+            print("Model training complete!")
             return True
 
         except Exception as e:
-            print(f"Error loading data: {e}")
+            print(f"Error in load_data: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -265,14 +279,16 @@ def predict():
         if not ticker:
             ticker = '^GSPC'
 
+        print(f"\n{'='*60}")
         print(f"Predicting for ticker: {ticker}")
+        print('='*60)
 
         predictor = StockPredictor(ticker)
 
         if not predictor.load_data():
             return jsonify({
                 'success': False, 
-                'error': f'Unable to fetch data for {ticker}. This may be due to: (1) Invalid ticker symbol, (2) Temporary connection issues, or (3) Data provider limitations. Please try again or use a different ticker.'
+                'error': f'Unable to fetch data for {ticker}. Yahoo Finance may be temporarily unavailable or the ticker symbol is invalid. Please try: (1) Another ticker like AAPL or MSFT, (2) Waiting a few moments and trying again.'
             }), 400
 
         prediction = predictor.predict_next_day()
@@ -283,6 +299,7 @@ def predict():
                 'error': 'Failed to generate prediction'
             }), 500
 
+        print(f"Prediction successful for {ticker}!")
         return jsonify({
             'success': True,
             'prediction': prediction
@@ -293,13 +310,13 @@ def predict():
         traceback.print_exc()
         return jsonify({
             'success': False, 
-            'error': f'Server error: {str(e)}'
+            'error': f'Server error: Please try again'
         }), 500
 
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
-    return jsonify({'status': 'healthy'})
+    return jsonify({'status': 'healthy', 'service': 'Stock Predictor API'})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
